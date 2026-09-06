@@ -16,7 +16,7 @@ on:
       profile:
         description: "Profil pemeriksaan"
         required: true
-        default: "standard"
+        default: "basic"
         type: choice
         options:
           - basic
@@ -50,7 +50,14 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: "pip"
+
+      - name: Tampilkan versi Python
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python --version
+          python -m pip --version
 
       - name: Perbarui alat instalasi
         shell: bash
@@ -71,14 +78,24 @@ jobs:
           python -m pip install \
             "mailaccess==0.14.4"
 
-      - name: Tampilkan informasi instalasi
+      - name: Tampilkan informasi MailAccess
         shell: bash
         run: |
           set -euo pipefail
 
           python -m pip show mailaccess
 
+          echo
+          echo "Bantuan MailAccess:"
+          echo
+
           mailaccess --help
+
+          echo
+          echo "Bantuan perintah investigate:"
+          echo
+
+          mailaccess investigate --help
 
       - name: Validasi masukan
         shell: bash
@@ -91,12 +108,37 @@ jobs:
             exit 1
           fi
 
-          if ! printf '%s' "$EMAIL_INPUT" |
-            grep -Eq \
-            '^[A-Za-z0-9.!#$%&'"'"'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$'; then
-            echo "Format alamat email tidak valid."
-            exit 1
-          fi
+          python - <<'PY'
+          import os
+          import re
+
+          email = os.environ.get(
+              "EMAIL_INPUT",
+              "",
+          ).strip()
+
+          pattern = re.compile(
+              r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+"
+              r"@?:[A-Za-z0-9-]{0,61}"
+              r"[A-Za-z0-9]?"
+              r"(?:\.?:[A-Za-z0-9-]{0,61}"
+              r"[A-Za-z0-9]?)+$"
+          )
+
+          if len(email) > 254:
+              raise SystemExit(
+                  "Alamat email terlalu panjang."
+              )
+
+          if not pattern.fullmatch(email):
+              raise SystemExit(
+                  "Format alamat email tidak valid."
+              )
+
+          print(
+              "Format alamat email valid."
+          )
+          PY
 
           case "$PROFILE_INPUT" in
             basic|standard|extended)
@@ -117,6 +159,8 @@ jobs:
           rm -rf "$REPORT_FOLDER"
 
           mkdir -p "$REPORT_FOLDER"
+
+          echo "Folder laporan: $REPORT_FOLDER"
 
       - name: Tentukan modul pemeriksaan
         id: modules
@@ -142,9 +186,11 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
           if [ -n "$MODULES" ]; then
-            echo "Menggunakan modul: $MODULES"
+            echo "Profil: $PROFILE_INPUT"
+            echo "Modul: $MODULES"
           else
-            echo "Menggunakan semua modul tanpa kunci."
+            echo "Profil: $PROFILE_INPUT"
+            echo "Menggunakan modul bawaan yang tersedia."
           fi
 
       - name: Jalankan pemeriksaan dasar
@@ -154,12 +200,16 @@ jobs:
           set -euo pipefail
 
           REPORT_FOLDER="reports/$JOB_ID"
+          REPORT_FILE="$REPORT_FOLDER/report.json"
+
+          echo "Memulai pemeriksaan email."
+          echo "Profil: $PROFILE_INPUT"
 
           mailaccess investigate \
             "$EMAIL_INPUT" \
             --modules \
             "${{ steps.modules.outputs.modules }}" \
-            -o "$REPORT_FOLDER/report.json"
+            -o "$REPORT_FILE"
 
       - name: Jalankan pemeriksaan lengkap
         if: steps.modules.outputs.modules == ''
@@ -168,27 +218,67 @@ jobs:
           set -euo pipefail
 
           REPORT_FOLDER="reports/$JOB_ID"
+          REPORT_FILE="$REPORT_FOLDER/report.json"
+
+          echo "Memulai pemeriksaan lengkap."
+          echo "Profil: $PROFILE_INPUT"
 
           mailaccess investigate \
             "$EMAIL_INPUT" \
-            -o "$REPORT_FOLDER/report.json"
+            -o "$REPORT_FILE"
+
+      - name: Cari laporan yang dihasilkan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT_FOLDER="reports/$JOB_ID"
+
+          echo "Isi folder laporan:"
+
+          find "$REPORT_FOLDER" \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p | %s byte\n' |
+            sort
+
+      - name: Normalisasi lokasi laporan JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT_FOLDER="reports/$JOB_ID"
+          EXPECTED_FILE="$REPORT_FOLDER/report.json"
+
+          if [ -s "$EXPECTED_FILE" ]; then
+            echo "Laporan ditemukan di lokasi utama."
+            exit 0
+          fi
+
+          FOUND_FILE="$(
+            find "$REPORT_FOLDER" \
+              -maxdepth 3 \
+              -type f \
+              -name '*.json' \
+              ! -name 'metadata.json' \
+              -print |
+              head -n 1
+          )"
+
+          if [ -z "$FOUND_FILE" ]; then
+            echo "Laporan JSON tidak ditemukan."
+            exit 1
+          fi
+
+          cp "$FOUND_FILE" "$EXPECTED_FILE"
+
+          echo "Laporan disalin dari:"
+          echo "$FOUND_FILE"
 
       - name: Validasi laporan JSON
         shell: bash
         run: |
           set -euo pipefail
-
-          REPORT_FILE="reports/$JOB_ID/report.json"
-
-          if [ ! -f "$REPORT_FILE" ]; then
-            echo "Laporan JSON tidak ditemukan."
-            exit 1
-          fi
-
-          if [ ! -s "$REPORT_FILE" ]; then
-            echo "Laporan JSON kosong."
-            exit 1
-          fi
 
           python - <<'PY'
           import json
@@ -203,20 +293,41 @@ jobs:
               / "report.json"
           )
 
-          with report_path.open(
-              "r",
-              encoding="utf-8",
-          ) as report_file:
-              report = json.load(
-                  report_file
+          if not report_path.exists():
+              raise SystemExit(
+                  "Laporan JSON tidak ditemukan."
               )
+
+          if report_path.stat().st_size == 0:
+              raise SystemExit(
+                  "Laporan JSON kosong."
+              )
+
+          try:
+              report = json.loads(
+                  report_path.read_text(
+                      encoding="utf-8"
+                  )
+              )
+          except json.JSONDecodeError as error:
+              preview = report_path.read_text(
+                  encoding="utf-8",
+                  errors="replace",
+              )[:500]
+
+              raise SystemExit(
+                  "Laporan bukan JSON valid. "
+                  "Isi awal: "
+                  + preview
+              ) from error
 
           if not isinstance(
               report,
               dict,
           ):
               raise SystemExit(
-                  "Struktur laporan JSON tidak valid."
+                  "Struktur utama laporan "
+                  "harus berupa object JSON."
               )
 
           print(
@@ -224,9 +335,21 @@ jobs:
           )
 
           print(
-              "Kunci utama:",
-              sorted(report.keys()),
+              "Ukuran laporan:",
+              report_path.stat().st_size,
+              "byte",
           )
+
+          print(
+              "Field tingkat atas:"
+          )
+
+          for key in sorted(
+              report.keys()
+          ):
+              print(
+                  "- " + str(key)
+              )
           PY
 
       - name: Buat metadata pekerjaan
@@ -250,6 +373,12 @@ jobs:
               / job_id
           )
 
+          report_files = sorted(
+              path.name
+              for path in report_folder.iterdir()
+              if path.is_file()
+          )
+
           metadata = {
               "jobId": job_id,
               "email": os.environ[
@@ -263,6 +392,9 @@ jobs:
                   timezone.utc
               ).isoformat(),
               "reportFile": "report.json",
+              "filesBeforeMetadata": (
+                  report_files
+              ),
               "authorizedUseOnly": True,
           }
 
@@ -278,6 +410,11 @@ jobs:
                   ensure_ascii=False,
               ),
               encoding="utf-8",
+          )
+
+          print(
+              "Metadata dibuat:",
+              metadata_path,
           )
           PY
 
@@ -311,7 +448,7 @@ jobs:
 
           findings = report.get(
               "findings",
-              []
+              [],
           )
 
           if not isinstance(
@@ -336,16 +473,24 @@ jobs:
               ),
           )
 
+          status = report.get(
+              "status",
+              "Tidak tersedia",
+          )
+
           lines = [
               "# Email OSINT Audit",
               "",
-              "## Ringkasan",
+              "## Metadata",
               "",
               "- Email: `"
               + os.environ["EMAIL_INPUT"]
               + "`",
               "- Profil: `"
               + os.environ["PROFILE_INPUT"]
+              + "`",
+              "- Status: `"
+              + str(status)
               + "`",
               "- Exposure score: `"
               + str(exposure_score)
@@ -357,13 +502,14 @@ jobs:
               + str(len(findings))
               + "`",
               "",
-              "## Temuan",
+              "## Temuan Lengkap",
               "",
           ]
 
           if not findings:
               lines.append(
-                  "Tidak ada temuan terstruktur."
+                  "Tidak ada temuan terstruktur "
+                  "pada field findings."
               )
           else:
               for index, finding in enumerate(
@@ -374,6 +520,16 @@ jobs:
                       finding,
                       dict,
                   ):
+                      lines.extend([
+                          "### Temuan "
+                          + str(index),
+                          "",
+                          "```text",
+                          str(finding),
+                          "```",
+                          "",
+                      ])
+
                       continue
 
                   platform = finding.get(
@@ -396,6 +552,11 @@ jobs:
                       "",
                   )
 
+                  metadata = finding.get(
+                      "metadata",
+                      {},
+                  )
+
                   lines.extend([
                       "### "
                       + str(index)
@@ -416,7 +577,35 @@ jobs:
                           + str(url)
                       )
 
+                  if metadata:
+                      lines.extend([
+                          "",
+                          "Metadata:",
+                          "",
+                          "```json",
+                          json.dumps(
+                              metadata,
+                              indent=2,
+                              ensure_ascii=False,
+                          ),
+                          "```",
+                      ])
+
                   lines.append("")
+
+          lines.extend([
+              "",
+              "## Laporan JSON Lengkap",
+              "",
+              "```json",
+              json.dumps(
+                  report,
+                  indent=2,
+                  ensure_ascii=False,
+              ),
+              "```",
+              "",
+          ])
 
           summary_path = (
               report_folder
@@ -426,6 +615,11 @@ jobs:
           summary_path.write_text(
               "\n".join(lines),
               encoding="utf-8",
+          )
+
+          print(
+              "Ringkasan dibuat:",
+              summary_path,
           )
           PY
 
@@ -450,6 +644,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "Laporan akhir:"
+
           find "reports/$JOB_ID" \
             -maxdepth 1 \
             -type f \
@@ -457,9 +653,10 @@ jobs:
             sort
 
       - name: Simpan artefak laporan
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mailaccess-${{ inputs.job_id }}
           path: reports/${{ inputs.job_id }}/
           retention-days: 7
-          if-no-files-found: error
+          if-no-files-found: warn

@@ -90,10 +90,6 @@ jobs:
           mailaccess --version
 
           echo
-          echo "Daftar perintah:"
-          mailaccess commands || true
-
-          echo
           echo "Bantuan investigate:"
           mailaccess investigate --help
 
@@ -152,13 +148,16 @@ jobs:
 
           if len(local_part) > 64:
               raise SystemExit(
-                  "Bagian sebelum @ melebihi "
-                  "64 karakter."
+                  "Bagian sebelum @ melebihi 64 karakter."
               )
 
-          if not domain_part:
+          if (
+              local_part.startswith(".")
+              or local_part.endswith(".")
+              or ".." in local_part
+          ):
               raise SystemExit(
-                  "Domain email tidak boleh kosong."
+                  "Penempatan titik pada email tidak valid."
               )
 
           local_pattern = re.compile(
@@ -180,18 +179,8 @@ jobs:
               local_part
           ):
               raise SystemExit(
-                  "Bagian sebelum @ mengandung "
+                  "Bagian sebelum @ memiliki "
                   "karakter yang tidak valid."
-              )
-
-          if (
-              local_part.startswith(".")
-              or local_part.endswith(".")
-              or ".." in local_part
-          ):
-              raise SystemExit(
-                  "Penempatan titik pada alamat "
-                  "email tidak valid."
               )
 
           if not domain_pattern.fullmatch(
@@ -207,15 +196,6 @@ jobs:
               + domain_part.lower()
           )
 
-          print(
-              "Format alamat email valid."
-          )
-
-          print(
-              "Domain:",
-              domain_part.lower(),
-          )
-
           with open(
               os.environ["GITHUB_ENV"],
               "a",
@@ -226,6 +206,9 @@ jobs:
                   + normalized_email
                   + "\n"
               )
+
+          print("Format alamat email valid.")
+          print("Domain:", domain_part.lower())
           PY
 
       - name: Validasi profil pemeriksaan
@@ -257,18 +240,19 @@ jobs:
           echo "Folder laporan:"
           echo "$REPORT_FOLDER"
 
-      - name: Periksa modul MailAccess
+      - name: Simpan daftar modul
         shell: bash
         run: |
           set -euo pipefail
 
           mailaccess modules \
-            > "reports/$JOB_ID/modules.txt"
+            > "reports/$JOB_ID/modules.txt" \
+            2>&1 || true
 
           cat "reports/$JOB_ID/modules.txt"
 
-      - name: Tentukan modul pemeriksaan
-        id: module_selection
+      - name: Tentukan konfigurasi pemeriksaan
+        id: config
         shell: bash
         run: |
           set -euo pipefail
@@ -277,35 +261,43 @@ jobs:
             basic)
               MODULES="gravatar,domain_intel"
               TIMEOUT="30"
+              ENABLE=""
               ;;
 
             standard)
               MODULES="gravatar,domain_intel,emailrep"
               TIMEOUT="45"
+              ENABLE=""
               ;;
 
             extended)
               MODULES=""
               TIMEOUT="60"
+              ENABLE="all"
               ;;
           esac
 
           {
             echo "modules=$MODULES"
             echo "timeout=$TIMEOUT"
+            echo "enable=$ENABLE"
           } >> "$GITHUB_OUTPUT"
 
           echo "Profil: $PROFILE_INPUT"
           echo "Timeout: $TIMEOUT detik"
 
           if [ -n "$MODULES" ]; then
-            echo "Modul: $MODULES"
+            echo "Modul utama: $MODULES"
           else
-            echo "Modul: seluruh modul bawaan yang tersedia"
+            echo "Modul utama: bawaan MailAccess"
           fi
 
-      - name: Jalankan pemeriksaan terpilih
-        if: steps.module_selection.outputs.modules != ''
+          if [ -n "$ENABLE" ]; then
+            echo "Modul opt-in: $ENABLE"
+          fi
+
+      - name: Jalankan pemeriksaan basic atau standard
+        if: steps.config.outputs.modules != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -322,14 +314,14 @@ jobs:
             "$NORMALIZED_EMAIL" \
             --format json \
             --modules \
-            "${{ steps.module_selection.outputs.modules }}" \
+            "${{ steps.config.outputs.modules }}" \
             --timeout \
-            "${{ steps.module_selection.outputs.timeout }}" \
+            "${{ steps.config.outputs.timeout }}" \
             --force \
             --output "$REPORT_FILE"
 
-      - name: Jalankan pemeriksaan lengkap
-        if: steps.module_selection.outputs.modules == ''
+      - name: Jalankan pemeriksaan extended
+        if: steps.config.outputs.modules == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -337,8 +329,7 @@ jobs:
           REPORT_FOLDER="reports/$JOB_ID"
           REPORT_FILE="$REPORT_FOLDER/report.json"
 
-          echo "Memulai pemeriksaan lengkap."
-          echo "Profil: $PROFILE_INPUT"
+          echo "Memulai pemeriksaan extended."
 
           mailaccess \
             --no-banner \
@@ -346,28 +337,14 @@ jobs:
             "$NORMALIZED_EMAIL" \
             --format json \
             --timeout \
-            "${{ steps.module_selection.outputs.timeout }}" \
+            "${{ steps.config.outputs.timeout }}" \
             --force \
             --show-collisions \
+            --enable \
+            "${{ steps.config.outputs.enable }}" \
             --output "$REPORT_FILE"
 
-      - name: Tampilkan isi folder laporan
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          REPORT_FOLDER="reports/$JOB_ID"
-
-          echo "Berkas yang tersedia:"
-
-          find "$REPORT_FOLDER" \
-            -maxdepth 3 \
-            -type f \
-            -printf '%p | %s byte\n' |
-            sort || true
-
-      - name: Temukan laporan JSON
+      - name: Temukan dan normalisasi laporan JSON
         shell: bash
         run: |
           set -euo pipefail
@@ -376,8 +353,7 @@ jobs:
           EXPECTED_FILE="$REPORT_FOLDER/report.json"
 
           if [ -s "$EXPECTED_FILE" ]; then
-            echo "Laporan tersedia:"
-            echo "$EXPECTED_FILE"
+            echo "Laporan JSON tersedia."
             exit 0
           fi
 
@@ -401,7 +377,7 @@ jobs:
           echo "Laporan dinormalisasi dari:"
           echo "$FOUND_FILE"
 
-      - name: Validasi laporan JSON
+      - name: Validasi dan analisis laporan JSON
         shell: bash
         run: |
           set -euo pipefail
@@ -409,6 +385,7 @@ jobs:
           python - <<'PY'
           import json
           import os
+          from collections import Counter
           from pathlib import Path
 
           job_id = os.environ["JOB_ID"]
@@ -429,90 +406,564 @@ jobs:
                   "Laporan JSON kosong."
               )
 
-          raw_content = report_path.read_text(
-              encoding="utf-8",
-              errors="replace",
-          )
-
           try:
               report = json.loads(
-                  raw_content
+                  report_path.read_text(
+                      encoding="utf-8"
+                  )
               )
           except json.JSONDecodeError as error:
               raise SystemExit(
-                  "Laporan bukan JSON valid. "
-                  "Isi awal: "
-                  + raw_content[:500]
+                  "Laporan bukan JSON valid."
               ) from error
 
-          if not isinstance(
-              report,
-              dict,
-          ):
+          if not isinstance(report, dict):
               raise SystemExit(
-                  "Struktur laporan harus berupa "
-                  "object JSON."
+                  "Struktur utama laporan harus "
+                  "berupa object JSON."
               )
 
-          print(
-              "Laporan JSON valid."
-          )
+          status = str(
+              report.get("status", "")
+          ).lower()
 
-          print(
-              "Ukuran:",
-              report_path.stat().st_size,
-              "byte",
-          )
-
-          print(
-              "Field tingkat atas:"
-          )
-
-          for key in sorted(
-              report.keys()
-          ):
-              print(
-                  "- " + str(key)
+          if status not in {
+              "complete",
+              "completed",
+          }:
+              raise SystemExit(
+                  "Investigasi tidak selesai. "
+                  "Status: "
+                  + status
               )
+
+          findings = report.get(
+              "findings",
+              [],
+          )
+
+          module_runs = report.get(
+              "module_runs",
+              [],
+          )
+
+          if not isinstance(findings, list):
+              findings = []
+
+          if not isinstance(module_runs, list):
+              module_runs = []
+
+          module_statuses = Counter(
+              str(item.get("status", "unknown"))
+              for item in module_runs
+              if isinstance(item, dict)
+          )
+
+          direct_findings = 0
+          username_pivots = 0
+
+          for finding in findings:
+              if not isinstance(finding, dict):
+                  continue
+
+              module_name = str(
+                  finding.get(
+                      "module_name",
+                      "",
+                  )
+              )
+
+              if module_name == "username_pivot":
+                  username_pivots += 1
+              else:
+                  direct_findings += 1
+
+          analysis = {
+              "status": status,
+              "findingCount": len(findings),
+              "directFindingCount": direct_findings,
+              "usernamePivotCount": username_pivots,
+              "moduleRunCount": len(module_runs),
+              "moduleStatuses": dict(
+                  module_statuses
+              ),
+              "exposureScore": report.get(
+                  "exposure_score"
+              ),
+              "exposureScorePct": report.get(
+                  "exposure_score_pct"
+              ),
+              "credentialRiskScore": report.get(
+                  "credential_risk_score"
+              ),
+              "credentialRiskBand": report.get(
+                  "credential_risk_band"
+              ),
+              "riskLevel": report.get(
+                  "risk_level"
+              ),
+              "nameConfidence": report.get(
+                  "name_confidence"
+              ),
+          }
+
+          analysis_path = (
+              report_path.parent
+              / "analysis.json"
+          )
+
+          analysis_path.write_text(
+              json.dumps(
+                  analysis,
+                  indent=2,
+                  ensure_ascii=False,
+              ),
+              encoding="utf-8",
+          )
+
+          print("Laporan JSON valid.")
+          print("Temuan:", len(findings))
+          print(
+              "Pivot username:",
+              username_pivots,
+          )
+          print(
+              "Temuan langsung:",
+              direct_findings,
+          )
+          print(
+              "Status modul:",
+              dict(module_statuses),
+          )
           PY
 
-      - name: Buat salinan laporan CSV
+      - name: Buat CSV dari snapshot JSON
         shell: bash
         run: |
           set -euo pipefail
 
-          REPORT_FOLDER="reports/$JOB_ID"
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          from pathlib import Path
 
-          mailaccess \
-            --no-banner \
-            investigate \
-            "$NORMALIZED_EMAIL" \
-            --format json \
-            --modules \
-            "${{ steps.module_selection.outputs.modules }}" \
-            --timeout \
-            "${{ steps.module_selection.outputs.timeout }}" \
-            --output "$REPORT_FOLDER/report.csv" \
-            || true
+          job_id = os.environ["JOB_ID"]
 
-      - name: Buat salinan laporan Markdown
+          folder = (
+              Path("reports")
+              / job_id
+          )
+
+          report = json.loads(
+              (
+                  folder
+                  / "report.json"
+              ).read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          findings = report.get(
+              "findings",
+              [],
+          )
+
+          if not isinstance(findings, list):
+              findings = []
+
+          output_path = (
+              folder
+              / "report.csv"
+          )
+
+          with output_path.open(
+              "w",
+              encoding="utf-8",
+              newline="",
+          ) as output_file:
+              writer = csv.DictWriter(
+                  output_file,
+                  fieldnames=[
+                      "module_name",
+                      "platform",
+                      "profile_url",
+                      "username",
+                      "confidence",
+                      "severity",
+                      "source",
+                      "created_at",
+                      "metadata_json",
+                  ],
+              )
+
+              writer.writeheader()
+
+              for finding in findings:
+                  if not isinstance(finding, dict):
+                      continue
+
+                  data = finding.get(
+                      "data",
+                      {},
+                  )
+
+                  if not isinstance(data, dict):
+                      data = {}
+
+                  metadata = data.get(
+                      "metadata",
+                      {},
+                  )
+
+                  if not isinstance(metadata, dict):
+                      metadata = {}
+
+                  writer.writerow({
+                      "module_name":
+                          finding.get(
+                              "module_name",
+                              "",
+                          ),
+                      "platform":
+                          data.get(
+                              "platform",
+                              "",
+                          ),
+                      "profile_url":
+                          data.get(
+                              "profile_url",
+                              data.get(
+                                  "url",
+                                  "",
+                              ),
+                          ),
+                      "username":
+                          data.get(
+                              "username",
+                              "",
+                          ),
+                      "confidence":
+                          data.get(
+                              "confidence",
+                              "",
+                          ),
+                      "severity":
+                          data.get(
+                              "severity",
+                              "",
+                          ),
+                      "source":
+                          metadata.get(
+                              "source",
+                              "",
+                          ),
+                      "created_at":
+                          finding.get(
+                              "created_at",
+                              "",
+                          ),
+                      "metadata_json":
+                          json.dumps(
+                              metadata,
+                              ensure_ascii=False,
+                              separators=(
+                                  ",",
+                                  ":",
+                              ),
+                          ),
+                  })
+
+          print(
+              "CSV dibuat:",
+              output_path,
+          )
+          PY
+
+      - name: Buat Markdown dari snapshot JSON
         shell: bash
         run: |
           set -euo pipefail
 
-          REPORT_FOLDER="reports/$JOB_ID"
+          python - <<'PY'
+          import json
+          import os
+          from collections import Counter
+          from pathlib import Path
 
-          mailaccess \
-            --no-banner \
-            investigate \
-            "$NORMALIZED_EMAIL" \
-            --format json \
-            --modules \
-            "${{ steps.module_selection.outputs.modules }}" \
-            --timeout \
-            "${{ steps.module_selection.outputs.timeout }}" \
-            --output "$REPORT_FOLDER/report.md" \
-            || true
+          job_id = os.environ["JOB_ID"]
+
+          folder = (
+              Path("reports")
+              / job_id
+          )
+
+          report = json.loads(
+              (
+                  folder
+                  / "report.json"
+              ).read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          findings = report.get(
+              "findings",
+              [],
+          )
+
+          module_runs = report.get(
+              "module_runs",
+              [],
+          )
+
+          if not isinstance(findings, list):
+              findings = []
+
+          if not isinstance(module_runs, list):
+              module_runs = []
+
+          module_statuses = Counter(
+              str(run.get("status", "unknown"))
+              for run in module_runs
+              if isinstance(run, dict)
+          )
+
+          pivot_findings = []
+          direct_findings = []
+
+          for finding in findings:
+              if not isinstance(finding, dict):
+                  continue
+
+              if (
+                  finding.get("module_name")
+                  == "username_pivot"
+              ):
+                  pivot_findings.append(
+                      finding
+                  )
+              else:
+                  direct_findings.append(
+                      finding
+                  )
+
+          lines = [
+              "# Email OSINT Audit",
+              "",
+              "## Ringkasan",
+              "",
+              "- Email: `"
+              + os.environ["NORMALIZED_EMAIL"]
+              + "`",
+              "- Profil: `"
+              + os.environ["PROFILE_INPUT"]
+              + "`",
+              "- Status: `"
+              + str(report.get("status", ""))
+              + "`",
+              "- Risk level: `"
+              + str(
+                  report.get(
+                      "risk_level",
+                      "Tidak tersedia",
+                  )
+              )
+              + "`",
+              "- Exposure score: `"
+              + str(
+                  report.get(
+                      "exposure_score",
+                      "Tidak tersedia",
+                  )
+              )
+              + "`",
+              "- Credential risk score: `"
+              + str(
+                  report.get(
+                      "credential_risk_score",
+                      "Tidak tersedia",
+                  )
+              )
+              + "`",
+              "- Temuan langsung: `"
+              + str(len(direct_findings))
+              + "`",
+              "- Kandidat pivot username: `"
+              + str(len(pivot_findings))
+              + "`",
+              "",
+              "## Status Modul",
+              "",
+          ]
+
+          for status, count in sorted(
+              module_statuses.items()
+          ):
+              lines.append(
+                  "- "
+                  + status
+                  + ": `"
+                  + str(count)
+                  + "`"
+              )
+
+          lines.extend([
+              "",
+              "## Ringkasan Sistem",
+              "",
+              str(
+                  report.get(
+                      "summary",
+                      "Tidak tersedia",
+                  )
+              ),
+              "",
+              "## Catatan Interpretasi",
+              "",
+              (
+                  "Kandidat profil berdasarkan bagian lokal "
+                  "alamat email bukan bukti bahwa setiap profil "
+                  "dimiliki oleh pemilik alamat email."
+              ),
+              "",
+              (
+                  "Setiap kandidat harus diverifikasi menggunakan "
+                  "sumber independen sebelum dikaitkan dengan "
+                  "identitas tertentu."
+              ),
+              "",
+              "## Temuan Langsung",
+              "",
+          ])
+
+          if not direct_findings:
+              lines.append(
+                  "Tidak ada temuan langsung."
+              )
+
+          for index, finding in enumerate(
+              direct_findings,
+              start=1,
+          ):
+              data = finding.get(
+                  "data",
+                  {},
+              )
+
+              if not isinstance(data, dict):
+                  data = {}
+
+              lines.extend([
+                  "### "
+                  + str(index)
+                  + ". "
+                  + str(
+                      data.get(
+                          "platform",
+                          finding.get(
+                              "module_name",
+                              "Temuan",
+                          ),
+                      )
+                  ),
+                  "",
+                  "- Modul: `"
+                  + str(
+                      finding.get(
+                          "module_name",
+                          "",
+                      )
+                  )
+                  + "`",
+                  "- Confidence: `"
+                  + str(
+                      data.get(
+                          "confidence",
+                          "Tidak tersedia",
+                      )
+                  )
+                  + "`",
+                  "- Severity: `"
+                  + str(
+                      data.get(
+                          "severity",
+                          "Tidak tersedia",
+                      )
+                  )
+                  + "`",
+                  "",
+              ])
+
+          lines.extend([
+              "",
+              "## Kandidat Pivot Username",
+              "",
+          ])
+
+          for index, finding in enumerate(
+              pivot_findings,
+              start=1,
+          ):
+              data = finding.get(
+                  "data",
+                  {},
+              )
+
+              if not isinstance(data, dict):
+                  data = {}
+
+              platform = str(
+                  data.get(
+                      "platform",
+                      "Tidak diketahui",
+                  )
+              )
+
+              profile_url = str(
+                  data.get(
+                      "profile_url",
+                      "",
+                  )
+              )
+
+              confidence = str(
+                  data.get(
+                      "confidence",
+                      "Tidak tersedia",
+                  )
+              )
+
+              lines.append(
+                  str(index)
+                  + ". "
+                  + platform
+                  + " | confidence: `"
+                  + confidence
+                  + "`"
+                  + (
+                      " | "
+                      + profile_url
+                      if profile_url
+                      else ""
+                  )
+              )
+
+          output_path = (
+              folder
+              / "summary.md"
+          )
+
+          output_path.write_text(
+              "\n".join(lines),
+              encoding="utf-8",
+          )
+
+          print(
+              "Markdown dibuat:",
+              output_path,
+          )
+          PY
 
       - name: Buat metadata pekerjaan
         shell: bash
@@ -530,14 +981,14 @@ jobs:
 
           job_id = os.environ["JOB_ID"]
 
-          report_folder = (
+          folder = (
               Path("reports")
               / job_id
           )
 
           generated_files = sorted(
               path.name
-              for path in report_folder.iterdir()
+              for path in folder.iterdir()
               if path.is_file()
           )
 
@@ -553,17 +1004,30 @@ jobs:
               "createdAt": datetime.now(
                   timezone.utc
               ).isoformat(),
+              "repository": os.environ.get(
+                  "GITHUB_REPOSITORY",
+                  "",
+              ),
+              "githubRunId": os.environ.get(
+                  "GITHUB_RUN_ID",
+                  "",
+              ),
+              "githubRunAttempt": os.environ.get(
+                  "GITHUB_RUN_ATTEMPT",
+                  "",
+              ),
               "primaryReport": "report.json",
-              "generatedFiles": generated_files,
+              "generatedFilesBeforeMetadata":
+                  generated_files,
               "authorizedUseOnly": True,
           }
 
-          metadata_path = (
-              report_folder
+          output_path = (
+              folder
               / "metadata.json"
           )
 
-          metadata_path.write_text(
+          output_path.write_text(
               json.dumps(
                   metadata,
                   indent=2,
@@ -574,221 +1038,17 @@ jobs:
 
           print(
               "Metadata dibuat:",
-              metadata_path,
+              output_path,
           )
           PY
 
-      - name: Buat ringkasan analisis
+      - name: Hapus file diagnostik dari paket utama
         shell: bash
         run: |
           set -euo pipefail
 
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          job_id = os.environ["JOB_ID"]
-
-          report_folder = (
-              Path("reports")
-              / job_id
-          )
-
-          report = json.loads(
-              (
-                  report_folder
-                  / "report.json"
-              ).read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          findings = report.get(
-              "findings",
-              [],
-          )
-
-          if not isinstance(
-              findings,
-              list,
-          ):
-              findings = []
-
-          exposure_score = report.get(
-              "exposure_score",
-              report.get(
-                  "exposureScore",
-                  "Tidak tersedia",
-              ),
-          )
-
-          risk_level = report.get(
-              "risk_level",
-              report.get(
-                  "riskLevel",
-                  "Tidak tersedia",
-              ),
-          )
-
-          status = report.get(
-              "status",
-              "Tidak tersedia",
-          )
-
-          summary = report.get(
-              "summary",
-              "Tidak tersedia",
-          )
-
-          lines = [
-              "# Email OSINT Audit",
-              "",
-              "## Ringkasan",
-              "",
-              "- Email: `"
-              + os.environ["NORMALIZED_EMAIL"]
-              + "`",
-              "- Profil: `"
-              + os.environ["PROFILE_INPUT"]
-              + "`",
-              "- Status: `"
-              + str(status)
-              + "`",
-              "- Exposure score: `"
-              + str(exposure_score)
-              + "`",
-              "- Risk level: `"
-              + str(risk_level)
-              + "`",
-              "- Jumlah temuan: `"
-              + str(len(findings))
-              + "`",
-              "",
-              "## Ikhtisar",
-              "",
-              str(summary),
-              "",
-              "## Temuan Lengkap",
-              "",
-          ]
-
-          if not findings:
-              lines.append(
-                  "Tidak ada temuan terstruktur "
-                  "dalam field findings."
-              )
-          else:
-              for index, finding in enumerate(
-                  findings,
-                  start=1,
-              ):
-                  if not isinstance(
-                      finding,
-                      dict,
-                  ):
-                      lines.extend([
-                          "### Temuan "
-                          + str(index),
-                          "",
-                          "```text",
-                          str(finding),
-                          "```",
-                          "",
-                      ])
-
-                      continue
-
-                  platform = finding.get(
-                      "platform",
-                      "Tidak diketahui",
-                  )
-
-                  confidence = finding.get(
-                      "confidence",
-                      "Tidak tersedia",
-                  )
-
-                  severity = finding.get(
-                      "severity",
-                      "Tidak tersedia",
-                  )
-
-                  url = finding.get(
-                      "url",
-                      "",
-                  )
-
-                  finding_metadata = finding.get(
-                      "metadata",
-                      {},
-                  )
-
-                  lines.extend([
-                      "### "
-                      + str(index)
-                      + ". "
-                      + str(platform),
-                      "",
-                      "- Confidence: `"
-                      + str(confidence)
-                      + "`",
-                      "- Severity: `"
-                      + str(severity)
-                      + "`",
-                  ])
-
-                  if url:
-                      lines.append(
-                          "- URL: "
-                          + str(url)
-                      )
-
-                  if finding_metadata:
-                      lines.extend([
-                          "",
-                          "Metadata:",
-                          "",
-                          "```json",
-                          json.dumps(
-                              finding_metadata,
-                              indent=2,
-                              ensure_ascii=False,
-                          ),
-                          "```",
-                      ])
-
-                  lines.append("")
-
-          lines.extend([
-              "",
-              "## JSON Lengkap",
-              "",
-              "```json",
-              json.dumps(
-                  report,
-                  indent=2,
-                  ensure_ascii=False,
-              ),
-              "```",
-              "",
-          ])
-
-          summary_path = (
-              report_folder
-              / "summary.md"
-          )
-
-          summary_path.write_text(
-              "\n".join(lines),
-              encoding="utf-8",
-          )
-
-          print(
-              "Ringkasan dibuat:",
-              summary_path,
-          )
-          PY
+          rm -f \
+            "reports/$JOB_ID/modules.txt"
 
       - name: Buat checksum
         shell: bash
@@ -796,6 +1056,9 @@ jobs:
           set -euo pipefail
 
           REPORT_FOLDER="reports/$JOB_ID"
+
+          rm -f \
+            "$REPORT_FOLDER/SHA256SUMS.txt"
 
           find "$REPORT_FOLDER" \
             -maxdepth 1 \
@@ -806,18 +1069,126 @@ jobs:
             xargs -0 sha256sum \
             > "$REPORT_FOLDER/SHA256SUMS.txt"
 
-      - name: Tampilkan daftar laporan akhir
+      - name: Validasi paket laporan
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Laporan akhir:"
+          REPORT_FOLDER="reports/$JOB_ID"
 
-          find "reports/$JOB_ID" \
+          REQUIRED_FILES=(
+            "report.json"
+            "report.csv"
+            "summary.md"
+            "analysis.json"
+            "metadata.json"
+            "SHA256SUMS.txt"
+          )
+
+          for FILE_NAME in \
+            "${REQUIRED_FILES[@]}"; do
+            FILE_PATH="$REPORT_FOLDER/$FILE_NAME"
+
+            if [ ! -s "$FILE_PATH" ]; then
+              echo "File tidak tersedia atau kosong:"
+              echo "$FILE_PATH"
+              exit 1
+            fi
+          done
+
+          echo "Seluruh file wajib tersedia."
+
+          find "$REPORT_FOLDER" \
             -maxdepth 1 \
             -type f \
             -printf '%f | %s byte\n' |
             sort
+
+      - name: Periksa sintaks pengirim
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [
+            ! -f \
+            "scripts/send_to_apps_script.py"
+          ]; then
+            echo \
+              "scripts/send_to_apps_script.py belum tersedia."
+            exit 1
+          fi
+
+          python -m py_compile \
+            scripts/send_to_apps_script.py
+
+          echo "Sintaks pengirim valid."
+
+      - name: Periksa konfigurasi webhook
+        id: webhook
+        env:
+          APPS_SCRIPT_WEBHOOK_URL: >-
+            ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
+
+          CALLBACK_SECRET: >-
+            ${{ secrets.CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENABLED="false"
+
+          if [
+            -n "$APPS_SCRIPT_WEBHOOK_URL"
+          ] && [
+            -n "$CALLBACK_SECRET"
+          ]; then
+            ENABLED="true"
+
+            echo \
+              "Webhook tersedia. Laporan akan dikirim."
+          else
+            echo \
+              "Webhook belum tersedia. Pengiriman dilewati."
+
+            echo \
+              "Artefak tetap akan disimpan."
+          fi
+
+          echo "enabled=$ENABLED" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Kirim laporan ke Apps Script
+        if: steps.webhook.outputs.enabled == 'true'
+        env:
+          APPS_SCRIPT_WEBHOOK_URL: >-
+            ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
+
+          CALLBACK_SECRET: >-
+            ${{ secrets.CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python \
+            scripts/send_to_apps_script.py \
+            "reports/$JOB_ID"
+
+      - name: Laporkan kegagalan ke Apps Script
+        if: failure() && steps.webhook.outputs.enabled == 'true'
+        env:
+          APPS_SCRIPT_WEBHOOK_URL: >-
+            ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
+
+          CALLBACK_SECRET: >-
+            ${{ secrets.CALLBACK_SECRET }}
+        shell: bash
+        run: |
+          python \
+            scripts/send_to_apps_script.py \
+            --failed \
+            "$JOB_ID" \
+            "Workflow Email OSINT Audit gagal." \
+            || true
 
       - name: Simpan artefak laporan
         if: always()

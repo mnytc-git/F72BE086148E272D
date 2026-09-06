@@ -35,7 +35,7 @@ jobs:
     name: Jalankan pemeriksaan email
     runs-on: ubuntu-latest
 
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       JOB_ID: ${{ inputs.job_id }}
@@ -78,7 +78,7 @@ jobs:
           python -m pip install \
             "mailaccess==0.14.4"
 
-      - name: Tampilkan informasi MailAccess
+      - name: Periksa instalasi MailAccess
         shell: bash
         run: |
           set -euo pipefail
@@ -86,18 +86,18 @@ jobs:
           python -m pip show mailaccess
 
           echo
-          echo "Bantuan MailAccess:"
-          echo
-
-          mailaccess --help
+          echo "Versi MailAccess:"
+          mailaccess --version
 
           echo
-          echo "Bantuan perintah investigate:"
-          echo
+          echo "Daftar perintah:"
+          mailaccess commands || true
 
+          echo
+          echo "Bantuan investigate:"
           mailaccess investigate --help
 
-      - name: Validasi masukan
+      - name: Validasi ID pekerjaan
         shell: bash
         run: |
           set -euo pipefail
@@ -108,6 +108,13 @@ jobs:
             exit 1
           fi
 
+          echo "ID pekerjaan valid."
+
+      - name: Validasi alamat email
+        shell: bash
+        run: |
+          set -euo pipefail
+
           python - <<'PY'
           import os
           import re
@@ -117,31 +124,118 @@ jobs:
               "",
           ).strip()
 
-          pattern = re.compile(
-              r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+"
-              r"@?:[A-Za-z0-9-]{0,61}"
-              r"[A-Za-z0-9]?"
-              r"(?:\.?:[A-Za-z0-9-]{0,61}"
-              r"[A-Za-z0-9]?)+$"
-          )
+          if not email:
+              raise SystemExit(
+                  "Alamat email belum tersedia."
+              )
 
           if len(email) > 254:
               raise SystemExit(
-                  "Alamat email terlalu panjang."
+                  "Alamat email melebihi 254 karakter."
               )
 
-          if not pattern.fullmatch(email):
+          if email.count("@") != 1:
               raise SystemExit(
-                  "Format alamat email tidak valid."
+                  "Alamat email harus memiliki "
+                  "tepat satu karakter @."
               )
+
+          local_part, domain_part = email.rsplit(
+              "@",
+              1,
+          )
+
+          if not local_part:
+              raise SystemExit(
+                  "Bagian sebelum @ tidak boleh kosong."
+              )
+
+          if len(local_part) > 64:
+              raise SystemExit(
+                  "Bagian sebelum @ melebihi "
+                  "64 karakter."
+              )
+
+          if not domain_part:
+              raise SystemExit(
+                  "Domain email tidak boleh kosong."
+              )
+
+          local_pattern = re.compile(
+              r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$"
+          )
+
+          domain_pattern = re.compile(
+              r"^(?=.{1,253}$)"
+              r"(?:"
+              r"[A-Za-z0-9]"
+              r"(?:[A-Za-z0-9-]{0,61}"
+              r"[A-Za-z0-9])?"
+              r"\."
+              r")+"
+              r"[A-Za-z]{2,63}$"
+          )
+
+          if not local_pattern.fullmatch(
+              local_part
+          ):
+              raise SystemExit(
+                  "Bagian sebelum @ mengandung "
+                  "karakter yang tidak valid."
+              )
+
+          if (
+              local_part.startswith(".")
+              or local_part.endswith(".")
+              or ".." in local_part
+          ):
+              raise SystemExit(
+                  "Penempatan titik pada alamat "
+                  "email tidak valid."
+              )
+
+          if not domain_pattern.fullmatch(
+              domain_part
+          ):
+              raise SystemExit(
+                  "Domain alamat email tidak valid."
+              )
+
+          normalized_email = (
+              local_part
+              + "@"
+              + domain_part.lower()
+          )
 
           print(
               "Format alamat email valid."
           )
+
+          print(
+              "Domain:",
+              domain_part.lower(),
+          )
+
+          with open(
+              os.environ["GITHUB_ENV"],
+              "a",
+              encoding="utf-8",
+          ) as environment_file:
+              environment_file.write(
+                  "NORMALIZED_EMAIL="
+                  + normalized_email
+                  + "\n"
+              )
           PY
+
+      - name: Validasi profil pemeriksaan
+        shell: bash
+        run: |
+          set -euo pipefail
 
           case "$PROFILE_INPUT" in
             basic|standard|extended)
+              echo "Profil valid: $PROFILE_INPUT"
               ;;
             *)
               echo "Profil pemeriksaan tidak valid."
@@ -160,10 +254,21 @@ jobs:
 
           mkdir -p "$REPORT_FOLDER"
 
-          echo "Folder laporan: $REPORT_FOLDER"
+          echo "Folder laporan:"
+          echo "$REPORT_FOLDER"
+
+      - name: Periksa modul MailAccess
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mailaccess modules \
+            > "reports/$JOB_ID/modules.txt"
+
+          cat "reports/$JOB_ID/modules.txt"
 
       - name: Tentukan modul pemeriksaan
-        id: modules
+        id: module_selection
         shell: bash
         run: |
           set -euo pipefail
@@ -171,30 +276,36 @@ jobs:
           case "$PROFILE_INPUT" in
             basic)
               MODULES="gravatar,domain_intel"
+              TIMEOUT="30"
               ;;
 
             standard)
               MODULES="gravatar,domain_intel,emailrep"
+              TIMEOUT="45"
               ;;
 
             extended)
               MODULES=""
+              TIMEOUT="60"
               ;;
           esac
 
-          printf 'modules=%s\n' "$MODULES" \
-            >> "$GITHUB_OUTPUT"
+          {
+            echo "modules=$MODULES"
+            echo "timeout=$TIMEOUT"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Profil: $PROFILE_INPUT"
+          echo "Timeout: $TIMEOUT detik"
 
           if [ -n "$MODULES" ]; then
-            echo "Profil: $PROFILE_INPUT"
             echo "Modul: $MODULES"
           else
-            echo "Profil: $PROFILE_INPUT"
-            echo "Menggunakan modul bawaan yang tersedia."
+            echo "Modul: seluruh modul bawaan yang tersedia"
           fi
 
-      - name: Jalankan pemeriksaan dasar
-        if: steps.modules.outputs.modules != ''
+      - name: Jalankan pemeriksaan terpilih
+        if: steps.module_selection.outputs.modules != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -205,14 +316,20 @@ jobs:
           echo "Memulai pemeriksaan email."
           echo "Profil: $PROFILE_INPUT"
 
-          mailaccess investigate \
-            "$EMAIL_INPUT" \
+          mailaccess \
+            --no-banner \
+            investigate \
+            "$NORMALIZED_EMAIL" \
+            --format json \
             --modules \
-            "${{ steps.modules.outputs.modules }}" \
-            -o "$REPORT_FILE"
+            "${{ steps.module_selection.outputs.modules }}" \
+            --timeout \
+            "${{ steps.module_selection.outputs.timeout }}" \
+            --force \
+            --output "$REPORT_FILE"
 
       - name: Jalankan pemeriksaan lengkap
-        if: steps.modules.outputs.modules == ''
+        if: steps.module_selection.outputs.modules == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -223,26 +340,34 @@ jobs:
           echo "Memulai pemeriksaan lengkap."
           echo "Profil: $PROFILE_INPUT"
 
-          mailaccess investigate \
-            "$EMAIL_INPUT" \
-            -o "$REPORT_FILE"
+          mailaccess \
+            --no-banner \
+            investigate \
+            "$NORMALIZED_EMAIL" \
+            --format json \
+            --timeout \
+            "${{ steps.module_selection.outputs.timeout }}" \
+            --force \
+            --show-collisions \
+            --output "$REPORT_FILE"
 
-      - name: Cari laporan yang dihasilkan
+      - name: Tampilkan isi folder laporan
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
 
           REPORT_FOLDER="reports/$JOB_ID"
 
-          echo "Isi folder laporan:"
+          echo "Berkas yang tersedia:"
 
           find "$REPORT_FOLDER" \
-            -maxdepth 2 \
+            -maxdepth 3 \
             -type f \
             -printf '%p | %s byte\n' |
-            sort
+            sort || true
 
-      - name: Normalisasi lokasi laporan JSON
+      - name: Temukan laporan JSON
         shell: bash
         run: |
           set -euo pipefail
@@ -251,13 +376,14 @@ jobs:
           EXPECTED_FILE="$REPORT_FOLDER/report.json"
 
           if [ -s "$EXPECTED_FILE" ]; then
-            echo "Laporan ditemukan di lokasi utama."
+            echo "Laporan tersedia:"
+            echo "$EXPECTED_FILE"
             exit 0
           fi
 
           FOUND_FILE="$(
             find "$REPORT_FOLDER" \
-              -maxdepth 3 \
+              -maxdepth 4 \
               -type f \
               -name '*.json' \
               ! -name 'metadata.json' \
@@ -272,7 +398,7 @@ jobs:
 
           cp "$FOUND_FILE" "$EXPECTED_FILE"
 
-          echo "Laporan disalin dari:"
+          echo "Laporan dinormalisasi dari:"
           echo "$FOUND_FILE"
 
       - name: Validasi laporan JSON
@@ -303,22 +429,20 @@ jobs:
                   "Laporan JSON kosong."
               )
 
+          raw_content = report_path.read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+
           try:
               report = json.loads(
-                  report_path.read_text(
-                      encoding="utf-8"
-                  )
+                  raw_content
               )
           except json.JSONDecodeError as error:
-              preview = report_path.read_text(
-                  encoding="utf-8",
-                  errors="replace",
-              )[:500]
-
               raise SystemExit(
                   "Laporan bukan JSON valid. "
                   "Isi awal: "
-                  + preview
+                  + raw_content[:500]
               ) from error
 
           if not isinstance(
@@ -326,8 +450,8 @@ jobs:
               dict,
           ):
               raise SystemExit(
-                  "Struktur utama laporan "
-                  "harus berupa object JSON."
+                  "Struktur laporan harus berupa "
+                  "object JSON."
               )
 
           print(
@@ -335,7 +459,7 @@ jobs:
           )
 
           print(
-              "Ukuran laporan:",
+              "Ukuran:",
               report_path.stat().st_size,
               "byte",
           )
@@ -351,6 +475,44 @@ jobs:
                   "- " + str(key)
               )
           PY
+
+      - name: Buat salinan laporan CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT_FOLDER="reports/$JOB_ID"
+
+          mailaccess \
+            --no-banner \
+            investigate \
+            "$NORMALIZED_EMAIL" \
+            --format json \
+            --modules \
+            "${{ steps.module_selection.outputs.modules }}" \
+            --timeout \
+            "${{ steps.module_selection.outputs.timeout }}" \
+            --output "$REPORT_FOLDER/report.csv" \
+            || true
+
+      - name: Buat salinan laporan Markdown
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT_FOLDER="reports/$JOB_ID"
+
+          mailaccess \
+            --no-banner \
+            investigate \
+            "$NORMALIZED_EMAIL" \
+            --format json \
+            --modules \
+            "${{ steps.module_selection.outputs.modules }}" \
+            --timeout \
+            "${{ steps.module_selection.outputs.timeout }}" \
+            --output "$REPORT_FOLDER/report.md" \
+            || true
 
       - name: Buat metadata pekerjaan
         shell: bash
@@ -373,7 +535,7 @@ jobs:
               / job_id
           )
 
-          report_files = sorted(
+          generated_files = sorted(
               path.name
               for path in report_folder.iterdir()
               if path.is_file()
@@ -382,7 +544,7 @@ jobs:
           metadata = {
               "jobId": job_id,
               "email": os.environ[
-                  "EMAIL_INPUT"
+                  "NORMALIZED_EMAIL"
               ],
               "profile": os.environ[
                   "PROFILE_INPUT"
@@ -391,10 +553,8 @@ jobs:
               "createdAt": datetime.now(
                   timezone.utc
               ).isoformat(),
-              "reportFile": "report.json",
-              "filesBeforeMetadata": (
-                  report_files
-              ),
+              "primaryReport": "report.json",
+              "generatedFiles": generated_files,
               "authorizedUseOnly": True,
           }
 
@@ -418,7 +578,7 @@ jobs:
           )
           PY
 
-      - name: Buat ringkasan Markdown
+      - name: Buat ringkasan analisis
         shell: bash
         run: |
           set -euo pipefail
@@ -435,13 +595,11 @@ jobs:
               / job_id
           )
 
-          report_path = (
-              report_folder
-              / "report.json"
-          )
-
           report = json.loads(
-              report_path.read_text(
+              (
+                  report_folder
+                  / "report.json"
+              ).read_text(
                   encoding="utf-8"
               )
           )
@@ -478,13 +636,18 @@ jobs:
               "Tidak tersedia",
           )
 
+          summary = report.get(
+              "summary",
+              "Tidak tersedia",
+          )
+
           lines = [
               "# Email OSINT Audit",
               "",
-              "## Metadata",
+              "## Ringkasan",
               "",
               "- Email: `"
-              + os.environ["EMAIL_INPUT"]
+              + os.environ["NORMALIZED_EMAIL"]
               + "`",
               "- Profil: `"
               + os.environ["PROFILE_INPUT"]
@@ -502,6 +665,10 @@ jobs:
               + str(len(findings))
               + "`",
               "",
+              "## Ikhtisar",
+              "",
+              str(summary),
+              "",
               "## Temuan Lengkap",
               "",
           ]
@@ -509,7 +676,7 @@ jobs:
           if not findings:
               lines.append(
                   "Tidak ada temuan terstruktur "
-                  "pada field findings."
+                  "dalam field findings."
               )
           else:
               for index, finding in enumerate(
@@ -552,7 +719,7 @@ jobs:
                       "",
                   )
 
-                  metadata = finding.get(
+                  finding_metadata = finding.get(
                       "metadata",
                       {},
                   )
@@ -577,14 +744,14 @@ jobs:
                           + str(url)
                       )
 
-                  if metadata:
+                  if finding_metadata:
                       lines.extend([
                           "",
                           "Metadata:",
                           "",
                           "```json",
                           json.dumps(
-                              metadata,
+                              finding_metadata,
                               indent=2,
                               ensure_ascii=False,
                           ),
@@ -595,7 +762,7 @@ jobs:
 
           lines.extend([
               "",
-              "## Laporan JSON Lengkap",
+              "## JSON Lengkap",
               "",
               "```json",
               json.dumps(
@@ -639,7 +806,7 @@ jobs:
             xargs -0 sha256sum \
             > "$REPORT_FOLDER/SHA256SUMS.txt"
 
-      - name: Tampilkan daftar laporan
+      - name: Tampilkan daftar laporan akhir
         shell: bash
         run: |
           set -euo pipefail
